@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (defaults to the Figma version)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 7z
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full
+      - name: Download Figma installer
+        run: curl --fail --location --retry 2 --output FigmaSetup.exe https://desktop.figma.com/win/FigmaSetup.exe
+      - name: Read Figma version
+        id: version
+        run: echo "version=$(./figma-version-tool.sh --exe FigmaSetup.exe --json | jq -r .selected_version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: FigmaSetup.exe
+
+  build:
+    needs: installer
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    strategy:
+      matrix:
+        include:
+          - format: appimage
+            deps: sudo apt-get update && sudo apt-get install -y p7zip-full wget imagemagick
+          - format: deb
+            deps: sudo apt-get update && sudo apt-get install -y p7zip-full wget imagemagick dpkg-dev
+          - format: rpm
+            container: fedora:latest
+            deps: dnf install -y 7zip wget curl ImageMagick rpm-build tar xz findutils file
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install build tools
+        run: ${{ matrix.deps }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: installer
+      - name: Build ${{ matrix.format }}
+        run: ./build.sh --build ${{ matrix.format }} --exe "$PWD/installer/FigmaSetup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.format }}
+          path: |
+            figma-desktop-*.AppImage
+            figma-desktop_*.deb
+            figma-desktop-*.rpm
+          if-no-files-found: error
+
+  release:
+    needs: [installer, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.installer.outputs.version }}
+          TAG: ${{ inputs.tag || needs.installer.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Figma Desktop $VERSION for Linux" \
+            --generate-notes \
+            --draft
